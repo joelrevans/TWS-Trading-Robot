@@ -1,0 +1,15 @@
+*.pdb
+*.user
+*.docker-compose.override.yml
+*.jfm
+*.dbmdl
+*.min.js
+*.min.css
+appsettings.json
+
+obj/
+bin/
+.vs/
+vs/
+
+.env
