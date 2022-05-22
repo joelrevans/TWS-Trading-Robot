@@ -94,9 +94,165 @@ namespace TWS_BOT
         public async Task CANCEL_ALL_ORDERS()
         {
             socket.reqGlobalCancel();
-            while(SUBMITTED_ORDERS.Count + PRE_SUBMITTED_ORDERS.Count + PENDING_SUBMIT_ORDERS.Count + PENDING_CANCEL_ORDERS.Count > 0)
-            {
+        }
 
+        public async Task<IEnumerable<ContractDetails>> GET_ALL_OPTIONS_CONTRACT_DETAILS(string symbol, int contract_id)
+        {
+            var available_options = new List<ContractDetails>();
+            var symbols_data = (await GET_SYMBOL_SAMPLES(symbol)).Where(x => x.Contract.Currency == "USD");
+            var symbol_data = symbols_data.Single(x => x.Contract.ConId == contract_id);
+
+            var option_chains = await GET_OPTION_CHAINS(symbol_data.Contract);
+            foreach (var option_chain in option_chains.Where(x => x.exchange == "SMART"))
+            {
+                foreach (var expiration in option_chain.expirations)
+                {
+                    foreach (var strike in option_chain.strikes)
+                    {
+                        var contract = new Contract()
+                        {
+                            Strike = strike,
+                            LastTradeDateOrContractMonth = expiration,
+                            Symbol = symbol,
+                            SecType = "OPT",
+                            Currency = "USD",
+                            Multiplier = option_chain.multiplier,
+                            PrimaryExch = option_chain.exchange
+                        };
+                        var contract_details = await GET_CONTRACT_DETAILS(contract);
+                        if (contract_details.Length > 0)
+                        {
+                            foreach (var contract_detail in contract_details)
+                            {
+                                available_options.Add(contract_detail);
+                                if (available_options.Count() % 100 == 0)
+                                {
+                                    Console.WriteLine(available_options.Count());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return available_options;
+        }
+
+        public async Task EXECUTE_NEGATIVE_PRICED_SPREADS_STRATEGY(string symbol, int contract_id, string even_account_id, string odd_account_id)
+        {
+            var available_options = await GET_ALL_OPTIONS_CONTRACT_DETAILS(symbol, contract_id);
+            foreach (var exchange_groups in available_options.GroupBy(x => x.Contract.Exchange).Where(x => x.Key == "SMART"))
+            {
+                foreach (var expiration_group in exchange_groups.GroupBy(x => x.RealExpirationDate))
+                {
+                    var calls = expiration_group.Where(x => x.Contract.Right == "C").OrderByDescending(x => x.Contract.Strike).ToArray();
+                    var puts = expiration_group.Where(x => x.Contract.Right == "P").OrderByDescending(x => x.Contract.Strike).ToArray();
+                    for (int i = 0; i + 1 < calls.Count(); ++i)
+                    {
+                        if (calls[i].Contract.Strike != puts[i].Contract.Strike)
+                        {
+                            throw new Exception("UH OH!");
+                        }
+                        {   //CALLS
+                            var contract = new Contract()
+                            {
+                                Symbol = symbol,
+                                SecType = "BAG",
+                                Currency = "USD",
+                                Exchange = exchange_groups.Key
+                            };
+
+                            var upper_leg = new ComboLeg()
+                            {
+                                ConId = calls[i].Contract.ConId,
+                                Ratio = 1,
+                                Action = "SELL",
+                                Exchange = calls[i].Contract.Exchange
+                            };
+
+                            var lower_leg = new ComboLeg()
+                            {
+                                ConId = calls[i + 1].Contract.ConId,
+                                Ratio = 1,
+                                Action = "BUY",
+                                Exchange = calls[i + 1].Contract.Exchange
+                            };
+
+                            contract.ComboLegs = new List<ComboLeg>();
+                            contract.ComboLegs.Add(upper_leg);
+                            contract.ComboLegs.Add(lower_leg);
+
+                            var order = new Order()
+                            {
+                                Action = "BUY",
+                                OrderType = "LMT",
+                                Tif = "GTC",
+                                TotalQuantity = 5,
+                                LmtPrice = -0.02,
+                                Account = i % 2 == 0 ? even_account_id : odd_account_id
+                            };
+
+                            var difference = calls[i].Contract.Strike - calls[i + 1].Contract.Strike;
+                            if (difference > 0)
+                            {
+                                await PLACE_ORDER(contract, order);
+                            }
+                            else
+                            {
+                                throw new Exception("This should be unreachable!");
+                            }
+                        }
+
+                        { //PUTS
+                            var contract = new Contract()
+                            {
+                                Symbol = symbol,
+                                SecType = "BAG",
+                                Currency = "USD",
+                                Exchange = exchange_groups.Key
+                            };
+
+                            var upper_leg = new ComboLeg()
+                            {
+                                ConId = puts[i].Contract.ConId,
+                                Ratio = 1,
+                                Action = "BUY",
+                                Exchange = puts[i].Contract.Exchange
+                            };
+
+                            var lower_leg = new ComboLeg()
+                            {
+                                ConId = puts[i + 1].Contract.ConId,
+                                Ratio = 1,
+                                Action = "SELL",
+                                Exchange = puts[i + 1].Contract.Exchange
+                            };
+
+                            contract.ComboLegs = new List<ComboLeg>();
+                            contract.ComboLegs.Add(upper_leg);
+                            contract.ComboLegs.Add(lower_leg);
+
+                            var order = new Order()
+                            {
+                                Action = "BUY",
+                                OrderType = "LMT",
+                                Tif = "GTC",
+                                TotalQuantity = 5,
+                                LmtPrice = -0.02,
+                                Account = i % 2 == 0 ? even_account_id : odd_account_id
+                            };
+
+                            var difference = puts[i].Contract.Strike - puts[i + 1].Contract.Strike;
+                            if (difference > 0)
+                            {
+                                await PLACE_ORDER(contract, order);
+                            }
+                            else
+                            {
+                                throw new Exception("This should be unreachable!");
+                            }
+                        }
+                    }
+                }
             }
         }
 
