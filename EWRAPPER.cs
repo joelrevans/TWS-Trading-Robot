@@ -91,6 +91,22 @@ namespace TWS_BOT
             }
         }
 
+        private Dictionary<int, DIVIDEND_SUMMARY> ACTIVE_DIVIDEND_SUMMARY_REQUESTS = new Dictionary<int, DIVIDEND_SUMMARY>();
+        public async Task<DIVIDEND_SUMMARY> GET_DIVIDEND_SUMMARY(string symbol)
+        {
+            var request_id = GET_NEW_REQUEST_ID();
+            await REQUESTS_THROTTLE();
+            socket.reqMktData(request_id, new Contract() { Symbol = symbol, SecType = "STK", Currency = "USD", Exchange = "SMART" }, "456", false, false, null);
+            ACTIVE_DIVIDEND_SUMMARY_REQUESTS.Add(request_id, new DIVIDEND_SUMMARY());
+            while (ACTIVE_REQUESTS.Contains(request_id))
+            {
+                await Task.Yield();
+            }
+            var retval = ACTIVE_DIVIDEND_SUMMARY_REQUESTS[request_id];
+            ACTIVE_DIVIDEND_SUMMARY_REQUESTS.Remove(request_id);
+            return retval;
+        }
+
         public async Task CANCEL_ALL_ORDERS()
         {
             socket.reqGlobalCancel();
@@ -99,42 +115,24 @@ namespace TWS_BOT
         public async Task<IEnumerable<ContractDetails>> GET_ALL_OPTIONS_CONTRACT_DETAILS(string symbol, int contract_id)
         {
             var available_options = new List<ContractDetails>();
-            var symbols_data = (await GET_SYMBOL_SAMPLES(symbol)).Where(x => x.Contract.Currency == "USD");
-            var symbol_data = symbols_data.Single(x => x.Contract.ConId == contract_id);
-
-            var option_chains = await GET_OPTION_CHAINS(symbol_data.Contract);
-            foreach (var option_chain in option_chains.Where(x => x.exchange == "SMART"))
+            
+            var contract = new Contract()
             {
-                foreach (var expiration in option_chain.expirations)
+                Symbol = symbol,
+                SecType = "OPT",
+                Currency = "USD",
+                PrimaryExch = "SMART"
+            };
+            var contract_details = await GET_CONTRACT_DETAILS(contract);
+            if (contract_details.Length > 0)
+            {
+                foreach (var contract_detail in contract_details)
                 {
-                    foreach (var strike in option_chain.strikes)
-                    {
-                        var contract = new Contract()
-                        {
-                            Strike = strike,
-                            LastTradeDateOrContractMonth = expiration,
-                            Symbol = symbol,
-                            SecType = "OPT",
-                            Currency = "USD",
-                            Multiplier = option_chain.multiplier,
-                            PrimaryExch = option_chain.exchange
-                        };
-                        var contract_details = await GET_CONTRACT_DETAILS(contract);
-                        if (contract_details.Length > 0)
-                        {
-                            foreach (var contract_detail in contract_details)
-                            {
-                                available_options.Add(contract_detail);
-                                if (available_options.Count() % 100 == 0)
-                                {
-                                    Console.WriteLine(available_options.Count());
-                                }
-                            }
-                        }
-                    }
+                    available_options.Add(contract_detail);
                 }
             }
-            return available_options;
+            
+            return available_options.Where(x=>x.UnderConId == contract_id);
         }
 
         public async Task EXECUTE_NEGATIVE_PRICED_SPREADS_STRATEGY(string symbol, int contract_id, string even_account_id, string odd_account_id)
@@ -256,6 +254,95 @@ namespace TWS_BOT
             }
         }
 
+        public async Task EXECUTE_CONVERSION_ARBITRAGE(string symbol, int contract_id, double annualized_return, string account)
+        {
+            var symbol_descriptions = await GET_SYMBOL_SAMPLES(symbol);
+            var symbol_description = symbol_descriptions.Single(x => x.Contract.ConId == contract_id);            
+            var available_options = await GET_ALL_OPTIONS_CONTRACT_DETAILS(symbol, contract_id);
+            if (!available_options.Any())
+            {
+                return;
+            }
+            var dividend_summary = await GET_DIVIDEND_SUMMARY(symbol);
+            foreach (var expiration_group in available_options.Where(x => x.Contract.Exchange == "SMART").GroupBy(x => x.RealExpirationDate))
+            {
+                var calls = expiration_group.Where(x => x.Contract.Right == "C").OrderByDescending(x => x.Contract.Strike).ToArray();
+                var puts = expiration_group.Where(x => x.Contract.Right == "P").OrderByDescending(x => x.Contract.Strike).ToArray();
+                for (int i = 0; i + 1 < calls.Count(); ++i)
+                {
+                    if (calls[i].Contract.Strike != puts[i].Contract.Strike)
+                    {
+                        throw new Exception("UH OH!");
+                    }
+
+                    double dividend = 0; 
+                    var expiration_date = HELPER.PARSE_DATE(expiration_group.Key);
+                    if(dividend_summary.NEXT_DIVIDEND_DATE != null && dividend_summary.NEXT_DIVIDEND_DATE.Value < expiration_date)
+                    {
+                        dividend = dividend_summary.NEXT_DIVIDEND_AMOUNT ?? 0;   
+                    }
+
+                    int contract_duration = (expiration_date - DateTime.Now).Days;
+
+                    if(contract_duration < 2 || contract_duration > 60)
+                    {
+                        continue;
+                    }
+                    double strike = calls[i].Contract.Strike;
+                    double conversion_spread_profit = strike - (strike + dividend) / ((annualized_return - 1) * contract_duration / 365 + 1);
+
+                    var contract = new Contract()
+                    {                        
+                        Symbol = symbol,
+                        SecType = "BAG",
+                        Currency = "USD",
+                        Exchange = "SMART"
+                    };
+
+                    var call_leg = new ComboLeg()
+                    {
+                        ConId = calls[i].Contract.ConId,
+                        Ratio = 1,
+                        Action = "SELL",
+                        Exchange = calls[i].Contract.Exchange
+                    };
+                            
+                    var put_leg = new ComboLeg()
+                    {
+                        ConId = puts[i].Contract.ConId,
+                        Ratio = 1,
+                        Action = "BUY",
+                        Exchange = calls[i].Contract.Exchange
+                    };
+
+                    var stock_leg = new ComboLeg()
+                    {
+                        ConId = symbol_description.Contract.ConId,
+                        Ratio = int.Parse(calls[i].Contract.Multiplier),
+                        Action = "BUY",
+                        Exchange = "SMART" //symbol_description.Contract.Exchange??symbol_description.Contract.PrimaryExch
+                    };
+
+                    contract.ComboLegs = new List<ComboLeg>();
+                    contract.ComboLegs.Add(call_leg);
+                    contract.ComboLegs.Add(put_leg);
+                    contract.ComboLegs.Add(stock_leg);
+
+                    var order = new Order()
+                    {
+                        Action = "BUY",
+                        OrderType = "LMT",
+                        Tif = "GTC",
+                        TotalQuantity = 1,
+                        LmtPrice = Math.Round(calls[i].Contract.Strike - Math.Max(conversion_spread_profit, 0) - 0.02, 2, MidpointRounding.ToZero),
+                        Account = account
+                    };
+
+                    await PLACE_ORDER(contract, order);
+                }
+            }
+        }
+
         private Dictionary<int, Order> PENDING_SUBMIT_ORDERS { get; set; } = new Dictionary<int, Order>();
         private Dictionary<int, Order> PENDING_CANCEL_ORDERS { get; set; } = new Dictionary<int, Order>();
         private Dictionary<int, Order> PRE_SUBMITTED_ORDERS { get; set; } = new Dictionary<int, Order>();
@@ -297,12 +384,12 @@ namespace TWS_BOT
 
         public void commissionReport(CommissionReport commissionReport)
         {
-            //System.Diagnostics.Debugger.Break();
+            Console.WriteLine("COMMISSION REPORT");
         }
 
         public void completedOrder(Contract contract, Order order, OrderState orderState)
         {
-            //System.Diagnostics.Debugger.Break();
+            Console.WriteLine("COMPLETED ORDER");
         }
 
         public void completedOrdersEnd()
@@ -376,16 +463,26 @@ namespace TWS_BOT
             Console.WriteLine($"ERROR: {str}");
         }
 
-        public void error(int id, int errorCode, string errorMsg)
-        { 
+        void EWrapper.error(int id, int errorCode, string errorMsg, string advancedOrderRejectJson)
+        {
             switch (errorCode)
             {
+                case 162:
+                    break;
+                case 165:
+                    break;
                 case 200:
                     ACTIVE_REQUESTS.Remove(id);
+                    ACTIVE_PLACE_ORDER_REQUESTS.Remove(id);
+                    Console.WriteLine($"Code: {errorCode}\nMsg: {errorMsg}\nReqId:{id}");
                     break;
                 case 201:
-                    Console.WriteLine($"Code: {errorCode}\nMsg: {errorMsg}");
+                    Console.WriteLine($"Code: {errorCode}\nMsg: {errorMsg}\nReqId:{id}");
                     ACTIVE_PLACE_ORDER_REQUESTS.Remove(id);
+                    break;
+                case 354:
+                    Console.WriteLine($"Code: {errorCode}\nMsg: {errorMsg}\nReqId:{id}");
+                    ACTIVE_REQUESTS.Remove(id);
                     break;
                 case 2104:
                     break;
@@ -397,14 +494,14 @@ namespace TWS_BOT
                 case 2158:
                     break;
                 default:
-                    Console.WriteLine($"Code: {errorCode}\nMsg: {errorMsg}");
+                    Console.WriteLine($"Code: {errorCode}\nMsg: {errorMsg}\nReqId:{id}");
                     break;
             }
         }
 
         public void execDetails(int reqId, Contract contract, Execution execution)
         {
-            
+            Console.WriteLine("Exec Details");
         }
 
         public void execDetailsEnd(int reqId)
@@ -487,7 +584,8 @@ namespace TWS_BOT
 
         public void marketDataType(int reqId, int marketDataType)
         {
-            System.Diagnostics.Debugger.Break();
+            Console.WriteLine("marketDataType");
+            //System.Diagnostics.Debugger.Break();
         }
 
         public void marketRule(int marketRuleId, PriceIncrement[] priceIncrements)
@@ -658,14 +756,31 @@ namespace TWS_BOT
             System.Diagnostics.Debugger.Break();
         }
 
+        Dictionary<int, List<ContractDetails>> SCAN_RESULT_QUEUE = new Dictionary<int, List<ContractDetails>>();
+        public async Task<IEnumerable<ContractDetails>> GET_SCAN_RESULTS(ScannerSubscription scan_parameters)
+        {
+            var request_id = GET_NEW_REQUEST_ID();
+            await REQUESTS_THROTTLE();
+            socket.reqScannerSubscription(request_id, scan_parameters, "", "");
+            SCAN_RESULT_QUEUE.Add(request_id, new List<ContractDetails>());
+            while (ACTIVE_REQUESTS.Contains(request_id))
+            {
+                await Task.Yield();
+            }
+            var retval = SCAN_RESULT_QUEUE[request_id];
+            SCAN_RESULT_QUEUE.Remove(request_id);
+            return retval;
+        }
+
         public void scannerData(int reqId, int rank, ContractDetails contractDetails, string distance, string benchmark, string projection, string legsStr)
         {
-            System.Diagnostics.Debugger.Break();
+            SCAN_RESULT_QUEUE[reqId].Add(contractDetails);
         }
 
         public void scannerDataEnd(int reqId)
         {
-            System.Diagnostics.Debugger.Break();
+            ACTIVE_REQUESTS.Remove(reqId);
+            socket.cancelScannerSubscription(reqId);
         }
 
         public void scannerParameters(string xml)
@@ -695,7 +810,7 @@ namespace TWS_BOT
                 exchange = exchange,
                 underlyingConId = underlyingConId,
                 tradingClass = tradingClass,
-                multiplier = multiplier,
+                multiplier = int.Parse(multiplier),
                 expirations = expirations,
                 strikes = strikes
             };
@@ -758,7 +873,8 @@ namespace TWS_BOT
 
         public void tickGeneric(int tickerId, int field, double value)
         {
-            System.Diagnostics.Debugger.Break();
+            Console.WriteLine("tickGeneric");
+            //System.Diagnostics.Debugger.Break();
         }
 
         public void tickNews(int tickerId, long timeStamp, string providerCode, string articleId, string headline, string extraData)
@@ -773,27 +889,52 @@ namespace TWS_BOT
 
         public void tickPrice(int tickerId, int field, double price, TickAttrib attribs)
         {
-            System.Diagnostics.Debugger.Break();
+            Console.WriteLine("tickPrice");
+            //System.Diagnostics.Debugger.Break();
         }
 
         public void tickReqParams(int tickerId, double minTick, string bboExchange, int snapshotPermissions)
         {
-            System.Diagnostics.Debugger.Break();
+            Console.WriteLine("tickReqParams");
+            //System.Diagnostics.Debugger.Break();
         }
 
         public void tickSize(int tickerId, int field, int size)
         {
-            System.Diagnostics.Debugger.Break();
+            Console.WriteLine("tickSize");
+            //System.Diagnostics.Debugger.Break();
         }
 
         public void tickSnapshotEnd(int tickerId)
         {
-            System.Diagnostics.Debugger.Break();
+            ACTIVE_REQUESTS.Remove(tickerId);
         }
 
         public void tickString(int tickerId, int field, string value)
         {
-            System.Diagnostics.Debugger.Break();
+            if(field == 59)
+            {
+                string[] dividend_properties = value.Split(',');
+                var dividend_summary = ACTIVE_DIVIDEND_SUMMARY_REQUESTS[tickerId];
+                if (!string.IsNullOrWhiteSpace(dividend_properties[0]))
+                {
+                    dividend_summary.NEXT_12_MONTH_DIVIDEND_TOTAL = double.Parse(dividend_properties[0]);
+                }
+                if (!string.IsNullOrWhiteSpace(dividend_properties[1]))
+                {
+                    dividend_summary.PREV_12_MONTH_DIVIDEND_TOTAL = double.Parse(dividend_properties[1]);
+                }
+
+                if (!string.IsNullOrWhiteSpace(dividend_properties[2]))
+                {
+                    dividend_summary.NEXT_DIVIDEND_DATE = HELPER.PARSE_DATE(dividend_properties[2]);
+                }
+                if (!string.IsNullOrWhiteSpace(dividend_properties[3]))
+                {
+                    dividend_summary.NEXT_DIVIDEND_AMOUNT = double.Parse(dividend_properties[3]);
+                }
+                ACTIVE_REQUESTS.Remove(tickerId);
+            }
         }
 
         public void updateAccountTime(string timestamp)
@@ -842,6 +983,93 @@ namespace TWS_BOT
         }
 
         public void verifyMessageAPI(string apiData)
+        {
+            System.Diagnostics.Debugger.Break();
+        }
+
+        public void tickOptionComputation(int tickerId, int field, int tickAttrib, double impliedVolatility, double delta, double optPrice, double pvDividend, double gamma, double vega, double theta, double undPrice)
+        {
+            System.Diagnostics.Debugger.Break();
+        }
+
+        public void replaceFAEnd(int reqId, string text)
+        {
+            System.Diagnostics.Debugger.Break();
+        }
+
+        void EWrapper.tickSize(int tickerId, int field, decimal size)
+        {
+            Console.WriteLine("tickSize");
+            //System.Diagnostics.Debugger.Break();
+        }
+
+        void EWrapper.updatePortfolio(Contract contract, decimal position, double marketPrice, double marketValue, double averageCost, double unrealizedPNL, double realizedPNL, string accountName)
+        {
+            System.Diagnostics.Debugger.Break();
+        }
+
+        void EWrapper.orderStatus(int orderId, string status, decimal filled, decimal remaining, double avgFillPrice, int permId, int parentId, double lastFillPrice, int clientId, string whyHeld, double mktCapPrice)
+        {
+            //Console.WriteLine("orderStatus");
+            //System.Diagnostics.Debugger.Break();
+        }
+
+        void EWrapper.updateMktDepth(int tickerId, int position, int operation, int side, double price, decimal size)
+        {
+            System.Diagnostics.Debugger.Break();
+        }
+
+        void EWrapper.updateMktDepthL2(int tickerId, int position, string marketMaker, int operation, int side, double price, decimal size, bool isSmartDepth)
+        {
+            System.Diagnostics.Debugger.Break();
+        }
+
+        void EWrapper.position(string account, Contract contract, decimal pos, double avgCost)
+        {
+            System.Diagnostics.Debugger.Break();
+        }
+
+        void EWrapper.realtimeBar(int reqId, long date, double open, double high, double low, double close, decimal volume, decimal WAP, int count)
+        {
+            System.Diagnostics.Debugger.Break();
+        }
+
+        void EWrapper.positionMulti(int requestId, string account, string modelCode, Contract contract, decimal pos, double avgCost)
+        {
+            System.Diagnostics.Debugger.Break();
+        }
+
+        void EWrapper.pnlSingle(int reqId, decimal pos, double dailyPnL, double unrealizedPnL, double realizedPnL, double value)
+        {
+            System.Diagnostics.Debugger.Break();
+        }
+
+        void EWrapper.tickByTickAllLast(int reqId, int tickType, long time, double price, decimal size, TickAttribLast tickAttribLast, string exchange, string specialConditions)
+        {
+            System.Diagnostics.Debugger.Break();
+        }
+
+        void EWrapper.tickByTickBidAsk(int reqId, long time, double bidPrice, double askPrice, decimal bidSize, decimal askSize, TickAttribBidAsk tickAttribBidAsk)
+        {
+            System.Diagnostics.Debugger.Break();
+        }
+
+        void EWrapper.wshMetaData(int reqId, string dataJson)
+        {
+            System.Diagnostics.Debugger.Break();
+        }
+
+        void EWrapper.wshEventData(int reqId, string dataJson)
+        {
+            System.Diagnostics.Debugger.Break();
+        }
+
+        void EWrapper.historicalSchedule(int reqId, string startDateTime, string endDateTime, string timeZone, HistoricalSession[] sessions)
+        {
+            System.Diagnostics.Debugger.Break();
+        }
+
+        void EWrapper.userInfo(int reqId, string whiteBrandingId)
         {
             System.Diagnostics.Debugger.Break();
         }
