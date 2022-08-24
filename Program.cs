@@ -21,10 +21,18 @@ namespace TWS_BOT
             var wrapper = new EWRAPPER(7496, true);
             await wrapper.GET_NEXT_ORDER_ID();
 
-            {   //Use to get contract IDs for symbols
-                //var tmp = (await wrapper.GET_SYMBOL_SAMPLES("IRBT")).Where(x => x.Contract.Currency == "USD");
-                //System.Diagnostics.Debugger.Break();
+            if (false)
+            {
+                await wrapper.CANCEL_ALL_ORDERS();
             }
+
+            //{   //Use to get contract IDs for symbols
+            //    string symbol = "BBBY";
+            //    var tmp = (await wrapper.GET_SYMBOL_SAMPLES(symbol)).Where(x => x.Contract.Currency == "USD" && x.Contract.Symbol == symbol);
+            //    System.Diagnostics.Debugger.Break();
+            //}
+
+            //await wrapper.EXECUTE_NEGATIVE_PRICED_SPREADS_STRATEGY("BBBY", 266630, EVEN_ACCOUNT, ODD_ACCOUNT);
 
             var dividend_stocks_ascending = new ScannerSubscription()
             {
@@ -34,17 +42,15 @@ namespace TWS_BOT
                 NumberOfRows = 750
             };
 
-            if (true)
-            {
-                await wrapper.CANCEL_ALL_ORDERS();
-            }
-
-            var contract_details = await wrapper.GET_SCAN_RESULTS(dividend_stocks_ascending);
-            foreach (var stonk in contract_details)
+            var contract_details = await wrapper.GET_SCAN_RESULTS(dividend_stocks_ascending, null);
+            var random_generator = new Random();
+            foreach (var stonk in contract_details.OrderBy(x => random_generator.Next()))
             {
                 Console.WriteLine($"PROCESSING CONTRACT: {stonk.Contract.Symbol}");
-                await wrapper.EXECUTE_CONVERSION_ARBITRAGE(stonk.Contract.Symbol ?? stonk.Contract.LocalSymbol, stonk.Contract.ConId, 1.50, EVEN_ACCOUNT);
+                await wrapper.EXECUTE_CONVERSION_ARBITRAGE(stonk.Contract.Symbol ?? stonk.Contract.LocalSymbol, stonk.Contract.ConId, 1.10, ODD_ACCOUNT, 30, 5);
             }
+
+            //await wrapper.EXECUTE_CONVERSION_ARBITRAGE("ZIM", 468091282, 1.20, EVEN_ACCOUNT);
         }
     }
 }

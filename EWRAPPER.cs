@@ -102,6 +102,7 @@ namespace TWS_BOT
             {
                 await Task.Yield();
             }
+            socket.cancelMktData(request_id);
             var retval = ACTIVE_DIVIDEND_SUMMARY_REQUESTS[request_id];
             ACTIVE_DIVIDEND_SUMMARY_REQUESTS.Remove(request_id);
             return retval;
@@ -254,10 +255,15 @@ namespace TWS_BOT
             }
         }
 
-        public async Task EXECUTE_CONVERSION_ARBITRAGE(string symbol, int contract_id, double annualized_return, string account)
+        public async Task EXECUTE_CONVERSION_ARBITRAGE(string symbol, int contract_id, double annualized_return, string account, int max_age, int quantity = 1)
         {
             var symbol_descriptions = await GET_SYMBOL_SAMPLES(symbol);
-            var symbol_description = symbol_descriptions.Single(x => x.Contract.ConId == contract_id);            
+            var symbol_description = symbol_descriptions.Single(x => x.Contract.ConId == contract_id);
+            var option_chain = await GET_OPTION_CHAINS(symbol_description.Contract);
+            if(option_chain.Length == 0)
+            {
+                return;
+            }
             var available_options = await GET_ALL_OPTIONS_CONTRACT_DETAILS(symbol, contract_id);
             if (!available_options.Any())
             {
@@ -284,12 +290,12 @@ namespace TWS_BOT
 
                     int contract_duration = (expiration_date - DateTime.Now).Days;
 
-                    if(contract_duration < 2 || contract_duration > 60)
+                    if(contract_duration < 2 || contract_duration > max_age)
                     {
                         continue;
                     }
                     double strike = calls[i].Contract.Strike;
-                    double conversion_spread_profit = strike - (strike + dividend) / ((annualized_return - 1) * contract_duration / 365 + 1);
+                    double conversion_spread_profit = strike - (strike + dividend) / ((annualized_return - 1) * contract_duration / 365 + 1) - 0.02;
 
                     var contract = new Contract()
                     {                        
@@ -332,9 +338,9 @@ namespace TWS_BOT
                     {
                         Action = "BUY",
                         OrderType = "LMT",
-                        Tif = "GTC",
-                        TotalQuantity = 1,
-                        LmtPrice = Math.Round(calls[i].Contract.Strike - Math.Max(conversion_spread_profit, 0) - 0.02, 2, MidpointRounding.ToZero),
+                        Tif = "DAY",
+                        TotalQuantity = quantity,
+                        LmtPrice = Math.Round(calls[i].Contract.Strike - Math.Max(conversion_spread_profit, 0), 2, MidpointRounding.ToZero),
                         Account = account
                     };
 
@@ -584,7 +590,7 @@ namespace TWS_BOT
 
         public void marketDataType(int reqId, int marketDataType)
         {
-            Console.WriteLine("marketDataType");
+            //Console.WriteLine("marketDataType");
             //System.Diagnostics.Debugger.Break();
         }
 
@@ -757,11 +763,11 @@ namespace TWS_BOT
         }
 
         Dictionary<int, List<ContractDetails>> SCAN_RESULT_QUEUE = new Dictionary<int, List<ContractDetails>>();
-        public async Task<IEnumerable<ContractDetails>> GET_SCAN_RESULTS(ScannerSubscription scan_parameters)
+        public async Task<IEnumerable<ContractDetails>> GET_SCAN_RESULTS(ScannerSubscription scan_parameters, List<TagValue> scanner_filter_options)
         {
             var request_id = GET_NEW_REQUEST_ID();
             await REQUESTS_THROTTLE();
-            socket.reqScannerSubscription(request_id, scan_parameters, "", "");
+            socket.reqScannerSubscription(request_id, scan_parameters, null, scanner_filter_options);
             SCAN_RESULT_QUEUE.Add(request_id, new List<ContractDetails>());
             while (ACTIVE_REQUESTS.Contains(request_id))
             {
@@ -873,7 +879,7 @@ namespace TWS_BOT
 
         public void tickGeneric(int tickerId, int field, double value)
         {
-            Console.WriteLine("tickGeneric");
+            //Console.WriteLine("tickGeneric");
             //System.Diagnostics.Debugger.Break();
         }
 
@@ -889,19 +895,19 @@ namespace TWS_BOT
 
         public void tickPrice(int tickerId, int field, double price, TickAttrib attribs)
         {
-            Console.WriteLine("tickPrice");
+            //Console.WriteLine("tickPrice");
             //System.Diagnostics.Debugger.Break();
         }
 
         public void tickReqParams(int tickerId, double minTick, string bboExchange, int snapshotPermissions)
         {
-            Console.WriteLine("tickReqParams");
+            //Console.WriteLine("tickReqParams");
             //System.Diagnostics.Debugger.Break();
         }
 
         public void tickSize(int tickerId, int field, int size)
         {
-            Console.WriteLine("tickSize");
+            //Console.WriteLine("tickSize");
             //System.Diagnostics.Debugger.Break();
         }
 
